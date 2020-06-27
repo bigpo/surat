@@ -9,14 +9,19 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torchaudio
+from moviepy.editor import VideoFileClip
 from importlib.machinery import SourceFileLoader
+import mmcv
+import json
+from utils_su import blendshape_keys
 
 
 ROOT_PATH = os.getenv('SURAT_ROOT_PATH', False)
 if not ROOT_PATH:
     ROOT_PATH = os.path.dirname(__file__)
 DEVICE = torch.device('cuda')
-OUTPUT_COUNT = 8320 * 3  # 8320 vertex positions in 3 dimentions
+# OUTPUT_COUNT = 8320 * 3  # 8320 vertex positions in 3 dimentions
+OUTPUT_COUNT = 42 #blendshape 30fps
 INPUT_VALUES_PRECALC_PATH = os.path.join(ROOT_PATH, 'inputValues.precalc')
 
 lpc = SourceFileLoader(
@@ -33,20 +38,7 @@ class Data(Dataset):
         self.preview = validationAudioPath is not None
         self.shiftRandom = shiftRandom and not self.preview
         self.count = None
-
-        animFPS = 29.97  # samSoar recorded with an ipad
-
-        if self.preview:
-            inputSpeechPath = validationAudioPath
-        else:
-            inputSpeechPath = os.path.join(ROOT_PATH, 'data', 'samSoar', 'samSoar.wav')
-        self.waveform, self.sampleRate = torchaudio.load(inputSpeechPath)
-        if self.sampleRate != 16000:
-            self.waveform = torchaudio.transforms.Resample(self.sampleRate, 16000)(self.waveform)
-            self.sampleRate = 16000
-
-        self.count = int(animFPS * (self.waveform.size()[1] / self.sampleRate))
-
+        self.sampleRate = 16000
         self.LPC = lpc.LPCCoefficients(
             self.sampleRate,
             .032,
@@ -54,16 +46,43 @@ class Data(Dataset):
             order=31  # 32 - 1
         )
 
-        if os.path.exists(INPUT_VALUES_PRECALC_PATH):
-            self.inputValues = torch.load(INPUT_VALUES_PRECALC_PATH)
-        else:
-            print('pre-calculating input values...')
+        self.preprocess()
+
+    def preprocess(self):
+        data_root = '/media/songpo/backup/database_facial/facial_data_self_record'
+        videos = mmcv.file_walker(data_root, 'mp4')
+        labels = mmcv.file_walker(data_root, 'Json')
+
+
+        for video_path, label_path in zip(videos, labels):
+            audio_path = video_path.replace('mp4', 'wav')
+
+            if not os.path.exists(audio_path):
+                video_obj = VideoFileClip(video_path)
+                audio = video_obj.audio
+                audio.write_audiofile(audio_path)
+
+            self.labels = self._trans_blendshape(label_path)
+            self.count = len(self.labels)
+    
+            if os.path.exists(INPUT_VALUES_PRECALC_PATH):
+                self.inputValues = torch.load(INPUT_VALUES_PRECALC_PATH)
+                break
+        
+            self.waveform, self.sampleRate = torchaudio.load(audio_path)
+            if self.sampleRate != 16000:
+                self.waveform = torchaudio.transforms.Resample(self.sampleRate, 16000)(self.waveform)
+                self.sampleRate = 16000
+
+            # dbspecs = extract_one_file2(labels, audio_path)
+            
             self.inputValues = torch.Tensor([])
-            audioFrameLen = int(.016 * 16000 * (64 + 1))
+            audioFrameLen = int(.016 * 16000 * (64 + 1)) #固定一帧的长度
             audioHalfFrameLen = int(audioFrameLen / 2.)
-            for i in range(self.count):
+
+            for i in range(self.count): #样本总数
                 print('{}/{}'.format(i + 1, self.count))
-                audioRoll = -1 * (int(self.waveform.size()[1] / self.count) - audioHalfFrameLen)
+                audioRoll = -1 * (int(self.waveform.size(1) / self.count) - audioHalfFrameLen)
                 audioIdxRoll = int(i * audioRoll)
                 audioIdxRollPair = int((i + 1) * audioRoll)
 
@@ -85,6 +104,25 @@ class Data(Dataset):
                 ).view(-1, 1, 64, 32)
             self.inputValues = self.inputValues.view(-1, 2, 1, 64, 32)
             torch.save(self.inputValues, INPUT_VALUES_PRECALC_PATH)
+            break
+
+
+
+    def _trans_blendshape(self, file_path):
+        bs = mmcv.load(file_path, 'txt')
+        if isinstance(bs, list):
+            bs = bs[0]
+        if isinstance(bs, str):
+            bs = json.loads(bs)
+        bs = bs['anim2Saves']
+        frames_num = len(bs[0]['values'])
+        bs_trans = [[] for _ in range(frames_num)]
+        for i in range(frames_num):
+            for j in range(42):
+                assert bs[j]['m_bsName'] == blendshape_keys[j]
+                bs_trans[i].append(bs[j]['values'][i])
+        return bs_trans
+
 
     def __getitem__(self, i):
         if i < 0:  # for negative indexing
@@ -99,34 +137,38 @@ class Data(Dataset):
                 torch.zeros((1, OUTPUT_COUNT))
             )
 
+        # targetValue = torch.from_numpy(np.append(
+        #     np.load(
+        #         os.path.join(
+        #             ROOT_PATH,
+        #             'data', 'samSoar', 'maskSeq',
+        #             'mask.{:05d}.npy'.format(i + 1)
+        #         )
+        #     ),
+        #     np.load(
+        #         os.path.join(
+        #             ROOT_PATH,
+        #             'data', 'samSoar', 'maskSeq',
+        #             'mask.{:05d}.npy'.format(i + 2)
+        #         )
+        #     )
+        # )).float().view(-1, OUTPUT_COUNT)
+
         targetValue = torch.from_numpy(np.append(
-            np.load(
-                os.path.join(
-                    ROOT_PATH,
-                    'data', 'samSoar', 'maskSeq',
-                    'mask.{:05d}.npy'.format(i + 1)
-                )
-            ),
-            np.load(
-                os.path.join(
-                    ROOT_PATH,
-                    'data', 'samSoar', 'maskSeq',
-                    'mask.{:05d}.npy'.format(i + 2)
-                )
-            )
-        )).float().view(-1, OUTPUT_COUNT)
+            np.clip(self.labels[i+1], 0, 100), 
+            np.clip(self.labels[i+2], 0, 100))).float().view(-1, OUTPUT_COUNT)
 
         return (
             torch.Tensor([i]).long(),
             inputValue,
             # output values are assumed to have max of 2 and min of -2
-            (targetValue) * .5
+            (targetValue - 50.) / 50.
         )
 
     def __len__(self):
         if self.preview:
             return self.count
-        return self.count - 1  # for pairs
+        return self.count - 2  # for pairs
 
 class Model(nn.Module):
     def __init__(self, moodSize, filterMood=False):
@@ -146,9 +188,14 @@ class Model(nn.Module):
         )
 
         self.moodLen = 16
-        mood = np.random.normal(.0, 1., (moodSize, self.moodLen))
-        if filterMood:
+        mood = np.random.normal(.0, 1., (moodSize, self.moodLen)) #shape
+                                           #row: 为数据集的大小
+                                           #col：为自定义的隐变量的大小
+
+        if filterMood: #是否对mood进行滤波？
             mood = savgol_filter(mood, 129, 2, axis=0)
+
+        #将mood设定为可学习的参数。
         self.mood = nn.Parameter(
             torch.from_numpy(mood).float().view(moodSize, self.moodLen).to(DEVICE),
             requires_grad=True
@@ -239,7 +286,7 @@ def train():
 
     criterion = torch.nn.MSELoss().to(DEVICE)
     for epochIdx in range(epochCount):
-        for i, inputData, target in dataLoader:
+        for i, inputData, target in dataLoader: #i是什么？
             i = i.to(DEVICE)
             inputData = inputData.to(DEVICE)
             target = target.to(DEVICE)
@@ -267,7 +314,9 @@ def train():
                 model.mood[i + 1]
             )
 
-            (shapeLoss + motionLoss + emotionLoss).backward()
+            # (shapeLoss + motionLoss + emotionLoss).backward()
+            (shapeLoss + emotionLoss).backward()
+
             modelOptimizer.step()
 
         logWriter.add_scalar('emotion', emotionLoss.item(), epochIdx + 1)
